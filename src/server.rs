@@ -8,9 +8,7 @@ use crate::formatter::{TermFormatter, get_formatter};
 use crate::trace::{TraceManager, TraceParams};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -3856,260 +3854,7 @@ impl ErlDistMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
-}
 
-/// Parse a log event from a term.
-fn parse_log_event(term: &eetf::Term) -> Option<LogEvent> {
-    use crate::rpc;
-
-    // Log events can have various formats. Common format is a map with:
-    // #{time => Timestamp, level => Level, msg => Message, meta => Metadata}
-    if let eetf::Term::Map(event_map) = term {
-        let mut timestamp: Option<String> = None;
-        let mut level: Option<String> = None;
-        let mut message: Option<String> = None;
-        let mut metadata: Option<String> = None;
-
-        for (key, value) in &event_map.map {
-            if let eetf::Term::Atom(key_atom) = key {
-                match key_atom.name.as_str() {
-                    "time" | "timestamp" | "ts" => {
-                        timestamp = Some(format_log_timestamp(value));
-                    }
-                    "level" | "severity" => {
-                        level = Some(extract_atom_or_string(value));
-                    }
-                    "msg" | "message" | "report" => {
-                        message = Some(format_log_message(value));
-                    }
-                    "meta" | "metadata" => {
-                        metadata = Some(format_log_metadata(value));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Some(LogEvent {
-            timestamp: timestamp.unwrap_or_else(|| "unknown".to_string()),
-            level: level.unwrap_or_else(|| "info".to_string()),
-            message: message.unwrap_or_default(),
-            metadata,
-        })
-    } else if let Some(tuple_elements) = rpc::extract_tuple(term) {
-        // Alternative tuple format: {Level, Time, Message} or similar
-        if tuple_elements.len() >= 3 {
-            let level = extract_atom_or_string(&tuple_elements[0]);
-            let timestamp = format_log_timestamp(&tuple_elements[1]);
-            let message = format_log_message(&tuple_elements[2]);
-
-            Some(LogEvent {
-                timestamp,
-                level,
-                message,
-                metadata: None,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-/// Format a log timestamp from various term formats.
-fn format_log_timestamp(term: &eetf::Term) -> String {
-    use crate::rpc;
-
-    match term {
-        // Integer timestamp (milliseconds since epoch)
-        eetf::Term::FixInteger(i) => {
-            let secs = i.value as i64 / 1000;
-            if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
-                dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                format!("{}", i.value)
-            }
-        }
-        eetf::Term::BigInteger(b) => {
-            let result: Result<i64, _> = (&b.value).try_into();
-            if let Ok(value) = result {
-                // OTP logger uses microseconds; detect based on magnitude.
-                // Values > 10^13 are microseconds, otherwise milliseconds.
-                let (secs, nanos) = if value > 10_000_000_000_000 {
-                    (value / 1_000_000, ((value % 1_000_000) * 1000) as u32)
-                } else {
-                    (value / 1000, ((value % 1000) * 1_000_000) as u32)
-                };
-                if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                    return dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-                }
-            }
-            format!("{:?}", b.value)
-        }
-        // Tuple format: {MegaSecs, Secs, MicroSecs}
-        _ => {
-            if let Some(tuple_elements) = rpc::extract_tuple(term)
-                && tuple_elements.len() == 3
-                && let (Some(mega), Some(secs), Some(_micro)) = (
-                    extract_integer(&tuple_elements[0]),
-                    extract_integer(&tuple_elements[1]),
-                    extract_integer(&tuple_elements[2]),
-                )
-            {
-                let total_secs = mega * 1_000_000 + secs;
-                if let Some(dt) = chrono::DateTime::from_timestamp(total_secs as i64, 0) {
-                    return dt.format("%Y-%m-%d %H:%M:%S").to_string();
-                }
-            }
-            format!("{:?}", term)
-        }
-    }
-}
-
-/// Format a log message from various term formats.
-fn format_log_message(term: &eetf::Term) -> String {
-    match term {
-        eetf::Term::Binary(b) => String::from_utf8_lossy(&b.bytes).to_string(),
-        eetf::Term::List(_) => {
-            // Could be a charlist
-            if let Some(s) = extract_string(term) {
-                s
-            } else {
-                format!("{:?}", term)
-            }
-        }
-        eetf::Term::Atom(a) => a.name.clone(),
-        _ => format!("{:?}", term),
-    }
-}
-
-/// Format log metadata from a map term into a readable string.
-fn format_log_metadata(term: &eetf::Term) -> String {
-    if let eetf::Term::Map(map) = term {
-        let pairs: Vec<String> = map
-            .map
-            .iter()
-            .filter_map(|(key, value)| {
-                let k = extract_atom_or_string(key);
-                let v = extract_atom_or_string(value);
-                if v == "nil" {
-                    None
-                } else {
-                    Some(format!("{}: {}", k, v))
-                }
-            })
-            .collect();
-        pairs.join(", ")
-    } else {
-        extract_atom_or_string(term)
-    }
-}
-
-/// Extract an atom or string from a term.
-fn extract_atom_or_string(term: &eetf::Term) -> String {
-    match term {
-        eetf::Term::Atom(a) => a.name.clone(),
-        eetf::Term::Binary(b) => String::from_utf8_lossy(&b.bytes).to_string(),
-        eetf::Term::List(_) => {
-            if let Some(s) = extract_string(term) {
-                s
-            } else {
-                format!("{:?}", term)
-            }
-        }
-        _ => format!("{:?}", term),
-    }
-}
-
-// ============================================================================
-// RPC Call Tool
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct RpcCallRequest {
-    node: String,
-    module: String,
-    function: String,
-    args: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct RpcCallResponse {
-    node: String,
-    module: String,
-    function: String,
-    result: serde_json::Value,
-}
-
-// ============================================================================
-// Eval Code Tool
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct EvalCodeRequest {
-    node: String,
-    code: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bindings: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct EvalCodeResponse {
-    node: String,
-    code: String,
-    result: serde_json::Value,
-}
-
-/// Request for the get_module_info tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct GetModuleInfoRequest {
-    /// The node name to query.
-    #[schemars(description = "The node name to query")]
-    node: String,
-    /// The module name to inspect.
-    #[schemars(description = "The module name (atom, e.g. 'lists', 'gen_server')")]
-    module: String,
-}
-
-/// Response from the get_module_info tool.
-#[derive(Debug, Serialize)]
-struct GetModuleInfoResponse {
-    node: String,
-    module: String,
-    exports: serde_json::Value,
-    attributes: serde_json::Value,
-    compile: serde_json::Value,
-    md5: serde_json::Value,
-}
-
-/// Request for the list_module_functions tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct ListModuleFunctionsRequest {
-    /// The node name to query.
-    #[schemars(description = "The node name to query")]
-    node: String,
-    /// The module name to inspect.
-    #[schemars(description = "The module name (atom, e.g. 'lists', 'gen_server')")]
-    module: String,
-}
-
-/// Response from the list_module_functions tool.
-#[derive(Debug, Serialize)]
-struct ListModuleFunctionsResponse {
-    node: String,
-    module: String,
-    functions: Vec<FunctionExport>,
-}
-
-/// A function export with name and arity.
-#[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct FunctionExport {
-    function: String,
-    arity: u32,
-}
-
-impl ErlDistMcpServer {
     /// Make an arbitrary RPC call to an Erlang node.
     ///
     /// WARNING: This tool is potentially dangerous and requires the --allow-eval flag.
@@ -4145,7 +3890,10 @@ impl ErlDistMcpServer {
         name = "rpc_call",
         description = "Make an arbitrary RPC call to an Erlang node (requires --allow-eval flag)"
     )]
-    pub async fn tool_rpc_call(&self, request: RpcCallRequest) -> Result<CallToolResult, McpError> {
+    pub async fn tool_rpc_call(
+        &self,
+        Parameters(request): Parameters<RpcCallRequest>,
+    ) -> Result<CallToolResult, McpError> {
         // Check if eval is allowed
         if !self.state().allow_eval {
             return Ok(CallToolResult::error(vec![Content::text(
@@ -4244,7 +3992,7 @@ impl ErlDistMcpServer {
     )]
     pub async fn tool_eval_code(
         &self,
-        request: EvalCodeRequest,
+        Parameters(request): Parameters<EvalCodeRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Check if eval is allowed
         if !self.state().allow_eval {
@@ -4632,6 +4380,257 @@ impl ErlDistMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+}
+
+/// Parse a log event from a term.
+fn parse_log_event(term: &eetf::Term) -> Option<LogEvent> {
+    use crate::rpc;
+
+    // Log events can have various formats. Common format is a map with:
+    // #{time => Timestamp, level => Level, msg => Message, meta => Metadata}
+    if let eetf::Term::Map(event_map) = term {
+        let mut timestamp: Option<String> = None;
+        let mut level: Option<String> = None;
+        let mut message: Option<String> = None;
+        let mut metadata: Option<String> = None;
+
+        for (key, value) in &event_map.map {
+            if let eetf::Term::Atom(key_atom) = key {
+                match key_atom.name.as_str() {
+                    "time" | "timestamp" | "ts" => {
+                        timestamp = Some(format_log_timestamp(value));
+                    }
+                    "level" | "severity" => {
+                        level = Some(extract_atom_or_string(value));
+                    }
+                    "msg" | "message" | "report" => {
+                        message = Some(format_log_message(value));
+                    }
+                    "meta" | "metadata" => {
+                        metadata = Some(format_log_metadata(value));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Some(LogEvent {
+            timestamp: timestamp.unwrap_or_else(|| "unknown".to_string()),
+            level: level.unwrap_or_else(|| "info".to_string()),
+            message: message.unwrap_or_default(),
+            metadata,
+        })
+    } else if let Some(tuple_elements) = rpc::extract_tuple(term) {
+        // Alternative tuple format: {Level, Time, Message} or similar
+        if tuple_elements.len() >= 3 {
+            let level = extract_atom_or_string(&tuple_elements[0]);
+            let timestamp = format_log_timestamp(&tuple_elements[1]);
+            let message = format_log_message(&tuple_elements[2]);
+
+            Some(LogEvent {
+                timestamp,
+                level,
+                message,
+                metadata: None,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Format a log timestamp from various term formats.
+fn format_log_timestamp(term: &eetf::Term) -> String {
+    use crate::rpc;
+
+    match term {
+        // Integer timestamp (milliseconds since epoch)
+        eetf::Term::FixInteger(i) => {
+            let secs = i.value as i64 / 1000;
+            if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
+                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+            } else {
+                format!("{}", i.value)
+            }
+        }
+        eetf::Term::BigInteger(b) => {
+            let result: Result<i64, _> = (&b.value).try_into();
+            if let Ok(value) = result {
+                // OTP logger uses microseconds; detect based on magnitude.
+                // Values > 10^13 are microseconds, otherwise milliseconds.
+                let (secs, nanos) = if value > 10_000_000_000_000 {
+                    (value / 1_000_000, ((value % 1_000_000) * 1000) as u32)
+                } else {
+                    (value / 1000, ((value % 1000) * 1_000_000) as u32)
+                };
+                if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+                    return dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                }
+            }
+            format!("{:?}", b.value)
+        }
+        // Tuple format: {MegaSecs, Secs, MicroSecs}
+        _ => {
+            if let Some(tuple_elements) = rpc::extract_tuple(term)
+                && tuple_elements.len() == 3
+                && let (Some(mega), Some(secs), Some(_micro)) = (
+                    extract_integer(&tuple_elements[0]),
+                    extract_integer(&tuple_elements[1]),
+                    extract_integer(&tuple_elements[2]),
+                )
+            {
+                let total_secs = mega * 1_000_000 + secs;
+                if let Some(dt) = chrono::DateTime::from_timestamp(total_secs as i64, 0) {
+                    return dt.format("%Y-%m-%d %H:%M:%S").to_string();
+                }
+            }
+            format!("{:?}", term)
+        }
+    }
+}
+
+/// Format a log message from various term formats.
+fn format_log_message(term: &eetf::Term) -> String {
+    match term {
+        eetf::Term::Binary(b) => String::from_utf8_lossy(&b.bytes).to_string(),
+        eetf::Term::List(_) => {
+            // Could be a charlist
+            if let Some(s) = extract_string(term) {
+                s
+            } else {
+                format!("{:?}", term)
+            }
+        }
+        eetf::Term::Atom(a) => a.name.clone(),
+        _ => format!("{:?}", term),
+    }
+}
+
+/// Format log metadata from a map term into a readable string.
+fn format_log_metadata(term: &eetf::Term) -> String {
+    if let eetf::Term::Map(map) = term {
+        let pairs: Vec<String> = map
+            .map
+            .iter()
+            .filter_map(|(key, value)| {
+                let k = extract_atom_or_string(key);
+                let v = extract_atom_or_string(value);
+                if v == "nil" {
+                    None
+                } else {
+                    Some(format!("{}: {}", k, v))
+                }
+            })
+            .collect();
+        pairs.join(", ")
+    } else {
+        extract_atom_or_string(term)
+    }
+}
+
+/// Extract an atom or string from a term.
+fn extract_atom_or_string(term: &eetf::Term) -> String {
+    match term {
+        eetf::Term::Atom(a) => a.name.clone(),
+        eetf::Term::Binary(b) => String::from_utf8_lossy(&b.bytes).to_string(),
+        eetf::Term::List(_) => {
+            if let Some(s) = extract_string(term) {
+                s
+            } else {
+                format!("{:?}", term)
+            }
+        }
+        _ => format!("{:?}", term),
+    }
+}
+
+// ============================================================================
+// RPC Call Tool
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct RpcCallRequest {
+    node: String,
+    module: String,
+    function: String,
+    args: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct RpcCallResponse {
+    node: String,
+    module: String,
+    function: String,
+    result: serde_json::Value,
+}
+
+// ============================================================================
+// Eval Code Tool
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct EvalCodeRequest {
+    node: String,
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bindings: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct EvalCodeResponse {
+    node: String,
+    code: String,
+    result: serde_json::Value,
+}
+
+/// Request for the get_module_info tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct GetModuleInfoRequest {
+    /// The node name to query.
+    #[schemars(description = "The node name to query")]
+    node: String,
+    /// The module name to inspect.
+    #[schemars(description = "The module name (atom, e.g. 'lists', 'gen_server')")]
+    module: String,
+}
+
+/// Response from the get_module_info tool.
+#[derive(Debug, Serialize)]
+struct GetModuleInfoResponse {
+    node: String,
+    module: String,
+    exports: serde_json::Value,
+    attributes: serde_json::Value,
+    compile: serde_json::Value,
+    md5: serde_json::Value,
+}
+
+/// Request for the list_module_functions tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct ListModuleFunctionsRequest {
+    /// The node name to query.
+    #[schemars(description = "The node name to query")]
+    node: String,
+    /// The module name to inspect.
+    #[schemars(description = "The module name (atom, e.g. 'lists', 'gen_server')")]
+    module: String,
+}
+
+/// Response from the list_module_functions tool.
+#[derive(Debug, Serialize)]
+struct ListModuleFunctionsResponse {
+    node: String,
+    module: String,
+    functions: Vec<FunctionExport>,
+}
+
+/// A function export with name and arity.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FunctionExport {
+    function: String,
+    arity: u32,
 }
 
 /// Convert JSON value to Erlang term.
@@ -5817,21 +5816,16 @@ fn parse_memory_bytes(memory_str: &str) -> u64 {
 #[tool_handler]
 impl ServerHandler for ErlDistMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: env!("CARGO_PKG_NAME").to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Default::default()
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "Erlang Distribution MCP Server - Connect to Erlang/BEAM nodes for introspection, \
                  debugging, tracing, and code evaluation. Use connect_node to establish a connection \
-                 before using other tools."
-                    .to_string(),
-            ),
-        }
+                 before using other tools.",
+            )
     }
 }
 
