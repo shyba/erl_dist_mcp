@@ -4546,6 +4546,20 @@ fn extract_atom_or_string(term: &eetf::Term) -> String {
     }
 }
 
+fn json_array_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "description": "Any JSON value (converted to an Erlang term)" }
+    })
+}
+
+fn json_object_or_null_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "null"],
+        "description": "Optional JSON object with variable bindings"
+    })
+}
+
 // ============================================================================
 // RPC Call Tool
 // ============================================================================
@@ -4555,6 +4569,7 @@ struct RpcCallRequest {
     node: String,
     module: String,
     function: String,
+    #[schemars(schema_with = "json_array_schema")]
     args: Vec<serde_json::Value>,
 }
 
@@ -4575,6 +4590,7 @@ struct EvalCodeRequest {
     node: String,
     code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "json_object_or_null_schema")]
     bindings: Option<serde_json::Value>,
 }
 
